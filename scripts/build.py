@@ -65,14 +65,32 @@ def apify_request(method, path, token, body=None, params=None):
         return json.loads(resp.read())
 
 
-def fetch_posts(lookback_days):
+def get_token():
     token = os.environ.get("APIFY_TOKEN")
     if not token:
         sys.exit("APIFY_TOKEN is not set. Add it as a GitHub repository secret (see README).")
+    return token
+
+
+def fetch_existing_run(run_id):
+    """Rebuild from a run that already finished, at no extra Apify cost."""
+    token = get_token()
+    run = apify_request("GET", f"/actor-runs/{run_id}", token)["data"]
+    if run["status"] != "SUCCEEDED":
+        sys.exit(f"Apify run {run_id} has status {run['status']}, so there's nothing to reuse.")
+    items = apify_request(
+        "GET", f"/datasets/{run['defaultDatasetId']}/items", token, params={"clean": "true", "format": "json"}
+    )
+    log(f"Reused Apify run {run_id}: {len(items)} posts, no new scrape")
+    return items
+
+
+def fetch_posts(lookback_days, max_posts):
+    token = get_token()
     cfg = CONFIG["apify"]
     run_input = {
         "username": all_handles(),
-        "resultsLimit": cfg["max_posts_per_page"],
+        "resultsLimit": max_posts,
         "onlyPostsNewerThan": f"{lookback_days} days",
         "skipPinnedPosts": True,
         "dataDetailLevel": cfg["data_detail_level"],
@@ -219,23 +237,50 @@ def score_posts(history):
 
 
 # ---------------------------------------------------------------- thumbnails
-def cache_thumbnails(posts):
+def _download_thumb(image_url, target):
     from PIL import Image
 
+    req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = resp.read()
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img.thumbnail((360, 640))
+    img.save(target, "JPEG", quality=78, optimize=True)
+
+
+def cache_thumbnails(posts, budget_seconds=300, workers=16):
+    """Download small cover images in parallel. Anything not done within the budget
+    shows a placeholder today and gets picked up on tomorrow's run."""
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
     THUMBS.mkdir(parents=True, exist_ok=True)
-    keep = set()
+    keep = {f"{p['code']}.jpg" for p in posts}
+    todo = [p for p in sorted(posts, key=lambda p: p.get("score") or 0, reverse=True)
+            if p.get("image") and not (THUMBS / f"{p['code']}.jpg").exists()]
+    log(f"Downloading {len(todo)} thumbnails ({len(posts) - len(todo)} already cached)")
+
+    started, done, failed = time.time(), 0, 0
+    pool = ThreadPoolExecutor(max_workers=workers)
+    pending = {pool.submit(_download_thumb, p["image"], THUMBS / f"{p['code']}.jpg"): p for p in todo}
+    while pending:
+        remaining = budget_seconds - (time.time() - started)
+        if remaining <= 0:
+            log(f"Thumbnail time budget reached, {len(pending)} left for tomorrow")
+            break
+        finished, _ = wait(pending, timeout=min(remaining, 30), return_when=FIRST_COMPLETED)
+        for f in finished:
+            pending.pop(f)
+            if f.exception():
+                failed += 1
+            else:
+                done += 1
+        if finished and (done + failed) % 50 < len(finished):
+            log(f"Thumbnails: {done} saved, {failed} failed, {len(pending)} to go")
+    pool.shutdown(wait=False, cancel_futures=True)
+    log(f"Thumbnails finished: {done} saved, {failed} failed")
+
     for p in posts:
         target = THUMBS / f"{p['code']}.jpg"
-        keep.add(target.name)
-        if not target.exists() and p.get("image"):
-            try:
-                req = urllib.request.Request(p["image"], headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    img = Image.open(io.BytesIO(resp.read())).convert("RGB")
-                img.thumbnail((360, 640))
-                img.save(target, "JPEG", quality=78, optimize=True)
-            except Exception as exc:  # expired CDN link etc. -> dashboard shows a placeholder
-                log(f"Thumbnail failed for {p['code']}: {exc}")
         p["thumb"] = f"thumbs/{target.name}" if target.exists() else None
         p.pop("image", None)
     for f in THUMBS.glob("*.jpg"):
@@ -319,6 +364,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", action="store_true", help="pull 30 days to build baselines")
     ap.add_argument("--sample", action="store_true", help="use fake data, no API calls")
+    ap.add_argument("--from-run", default="", help="rebuild from a finished Apify run ID instead of scraping")
     args = ap.parse_args()
 
     lookup = group_lookup()
@@ -331,9 +377,14 @@ def main():
         render(scored, {"sample": True})
         return
 
-    days = CONFIG["apify"]["bootstrap_lookback_days"] if (args.bootstrap or not HISTORY_PATH.exists()) \
-        else CONFIG["apify"]["daily_lookback_days"]
-    raw = fetch_posts(days)
+    cfg = CONFIG["apify"]
+    first = args.bootstrap or not HISTORY_PATH.exists()
+    days = cfg["bootstrap_lookback_days"] if first else cfg["daily_lookback_days"]
+    if args.from_run.strip():
+        raw = fetch_existing_run(args.from_run.strip())
+    else:
+        max_posts = cfg["bootstrap_max_posts_per_page"] if first else cfg["daily_max_posts_per_page"]
+        raw = fetch_posts(days, max_posts)
     fresh = [p for p in (normalise(i, lookup) for i in raw) if p]
     returned = {p["owner"] for p in fresh}
     silent = sorted(h for h in all_handles() if h not in returned)
@@ -354,3 +405,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    os._exit(0)  # don't wait on any thumbnail download that's still hanging
