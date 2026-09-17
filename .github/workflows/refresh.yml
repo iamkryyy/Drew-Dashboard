@@ -9,6 +9,10 @@ on:
         description: "First run: pull 30 days so every page gets a baseline"
         type: boolean
         default: false
+      apify_run_id:
+        description: "Optional: rebuild from a finished Apify run ID (no new scrape)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -30,7 +34,7 @@ jobs:
       - name: Scrape Instagram and rebuild the dashboard
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-        run: python scripts/build.py ${{ inputs.bootstrap && '--bootstrap' || '' }}
+        run: python scripts/build.py ${{ inputs.bootstrap && '--bootstrap' || '' }} --from-run "${{ inputs.apify_run_id }}"
       - name: Save post history
         run: |
           git config user.name "dashboard-bot"
